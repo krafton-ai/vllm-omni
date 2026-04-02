@@ -25,6 +25,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.raon import RaonConfig
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -33,6 +34,7 @@ def _register_omni_hf_configs() -> None:
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("mistral", VoxtralTTSConfig),
+        ("raon", RaonConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

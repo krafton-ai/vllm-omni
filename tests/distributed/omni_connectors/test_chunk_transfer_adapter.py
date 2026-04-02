@@ -163,6 +163,30 @@ def test_process_and_restore_queues(build_adapter):
     assert adapter.waiting_for_chunk_running_requests == deque()
 
 
+def test_process_pending_chunks_skips_finalized_requests(build_adapter):
+    """Requests already finalized (cleanup ran, is_finished()==True) must not
+    be re-parked as WAITING_FOR_CHUNK, which would create zombie requests."""
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=8)
+
+    # Simulate a request that has been finalized: cleanup() already discarded
+    # it from finished_requests, but it is still physically in the running queue.
+    finished_req = _req("fin1", RequestStatus.FINISHED_STOPPED)
+    live_req = _req("live1", RequestStatus.RUNNING)
+
+    running_queue = [finished_req, live_req]
+    waiting_queue = DummyWaitingQueue()
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    # Finalized request must NOT be parked (status unchanged, not moved to chunk deque).
+    assert finished_req.status == RequestStatus.FINISHED_STOPPED
+    assert finished_req not in adapter.waiting_for_chunk_running_requests
+
+    # Live request without a ready chunk should be parked normally.
+    assert live_req.status == RequestStatus.WAITING_FOR_CHUNK
+    assert live_req in adapter.waiting_for_chunk_running_requests
+
+
 def test_postprocess_scheduler_output(build_adapter):
     adapter, _ = build_adapter()
     adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}

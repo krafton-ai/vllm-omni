@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import statistics
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -41,6 +42,12 @@ class StageRequestStats:
     postprocess_time_ms: float = 0.0
     diffusion_metrics: dict[str, int] = None
     audio_generated_frames: int = 0
+    ttft_ms: float = 0.0
+    avg_tbt_ms: float = 0.0
+    min_tbt_ms: float = 0.0
+    max_tbt_ms: float = 0.0
+    p50_tbt_ms: float = 0.0
+    p99_tbt_ms: float = 0.0
 
     @property
     def rx_mbps(self) -> float:
@@ -78,10 +85,59 @@ class RequestE2EStats:
     e2e_total_tokens: int
     transfers_total_time_ms: float
     transfers_total_bytes: int
+    ttft_ms: float = 0.0
 
     @property
     def e2e_tpt(self) -> float:
         return (self.e2e_total_ms / self.e2e_total_tokens) if self.e2e_total_tokens > 0 else 0.0
+
+
+class TokenTimingTracker:
+    """Tracks per-token timestamps to compute TTFT and TBT statistics."""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        self._start_ts: float = time.perf_counter()
+        self._token_ts: list[float] = []
+
+    def record_token(self) -> None:
+        """Record the timestamp of a generated token."""
+        self._token_ts.append(time.perf_counter())
+
+    def compute_ttft(self) -> float:
+        """Return time from request start to first token in milliseconds."""
+        if not self._token_ts:
+            return 0.0
+        return (self._token_ts[0] - self._start_ts) * 1000.0
+
+    def compute_tbt_stats(self) -> dict[str, float]:
+        """Compute inter-token interval statistics in milliseconds."""
+        if len(self._token_ts) < 2:
+            return {"avg": 0.0, "min": 0.0, "max": 0.0, "p50": 0.0, "p99": 0.0}
+        intervals_ms = [(self._token_ts[i] - self._token_ts[i - 1]) * 1000.0 for i in range(1, len(self._token_ts))]
+        sorted_intervals = sorted(intervals_ms)
+        n = len(sorted_intervals)
+        p50 = sorted_intervals[int(n * 0.50)]
+        p99 = sorted_intervals[min(int(n * 0.99), n - 1)]
+        return {
+            "avg": statistics.mean(intervals_ms),
+            "min": min(intervals_ms),
+            "max": max(intervals_ms),
+            "p50": p50,
+            "p99": p99,
+        }
+
+    def to_stats_fields(self) -> dict[str, float]:
+        """Return a dict of all timing fields ready to set on StageRequestStats."""
+        tbt = self.compute_tbt_stats()
+        return {
+            "ttft_ms": self.compute_ttft(),
+            "avg_tbt_ms": tbt["avg"],
+            "min_tbt_ms": tbt["min"],
+            "max_tbt_ms": tbt["max"],
+            "p50_tbt_ms": tbt["p50"],
+            "p99_tbt_ms": tbt["p99"],
+        }
 
 
 # === Field Configuration ===
@@ -350,6 +406,23 @@ class OrchestratorAggregator:
 
         self.record_transfer_rx(stats)
 
+    def record_token_timing(self, stage_id: int, req_id: Any, tracker: TokenTimingTracker) -> None:
+        """Populate TTFT/TBT fields on the StageRequestStats for (stage_id, req_id)."""
+        try:
+            rid_key = str(req_id)
+            for stats in self.stage_events.get(rid_key, []):
+                if stats.stage_id == stage_id:
+                    timing = tracker.to_stats_fields()
+                    stats.ttft_ms = timing["ttft_ms"]
+                    stats.avg_tbt_ms = timing["avg_tbt_ms"]
+                    stats.min_tbt_ms = timing["min_tbt_ms"]
+                    stats.max_tbt_ms = timing["max_tbt_ms"]
+                    stats.p50_tbt_ms = timing["p50_tbt_ms"]
+                    stats.p99_tbt_ms = timing["p99_tbt_ms"]
+                    break
+        except Exception:
+            logger.debug("Failed to record token timing for req %s", req_id, exc_info=True)
+
     def record_stage_postprocess_time(self, stage_id: int, req_id: Any, postproc_time_ms: float) -> None:
         if req_id in self.stage_events:
             for stats in self.stage_events[req_id]:
@@ -448,6 +521,24 @@ class OrchestratorAggregator:
         self.e2e_total_tokens += total_tokens
         self.e2e_count += 1
         self.e2e_done.add(rid_key)
+        # Extract TTFT and avg TBT from stage events for structured logging
+        ttft_ms = 0.0
+        avg_tbt_ms = 0.0
+        if rid_key in self.stage_events:
+            for evt in self.stage_events[rid_key]:
+                if evt.ttft_ms > 0 and ttft_ms == 0.0:
+                    ttft_ms = evt.ttft_ms
+                if evt.avg_tbt_ms > 0 and avg_tbt_ms == 0.0:
+                    avg_tbt_ms = evt.avg_tbt_ms
+        tokens_per_s = (total_tokens * 1000.0 / e2e_ms) if e2e_ms > 0 else 0.0
+        logger.info(
+            "[metrics] request_id=%s ttft_ms=%.2f avg_tbt_ms=%.2f tokens_per_s=%.2f",
+            rid_key,
+            ttft_ms,
+            avg_tbt_ms,
+            tokens_per_s,
+        )
+
         per_req_record = RequestE2EStats(
             request_id=rid_key,
             e2e_total_ms=e2e_ms,
@@ -458,6 +549,7 @@ class OrchestratorAggregator:
             transfers_total_bytes=int(
                 sum(evt.size_bytes for evt in self.transfer_events.values() if evt.request_id == rid_key)
             ),
+            ttft_ms=ttft_ms,
         )
         self.e2e_events.append(per_req_record)
 
@@ -480,12 +572,45 @@ class OrchestratorAggregator:
             for i in range(self.num_stages)
         ]
 
+        # Compute avg TTFT and TBT across all requests
+        all_ttft = [e.ttft_ms for e in self.e2e_events if e.ttft_ms > 0]
+        avg_ttft_ms = statistics.mean(all_ttft) if all_ttft else 0.0
+        all_avg_tbt = [
+            s.avg_tbt_ms
+            for evts in self.stage_events.values()
+            for s in evts
+            if s.avg_tbt_ms > 0
+        ]
+        avg_tbt_ms = statistics.mean(all_avg_tbt) if all_avg_tbt else 0.0
+
+        # Compute throughput metrics
+        total_in_tokens = sum(
+            evt.num_tokens_in
+            for evts in self.stage_events.values()
+            for evt in evts
+            if evt.stage_id == 0
+        )
+        total_out_tokens = sum(
+            evt.num_tokens_out for evts in self.stage_events.values() for evt in evts
+        )
+        total_audio_frames = sum(
+            evt.audio_generated_frames for evts in self.stage_events.values() for evt in evts
+        )
+        input_tokens_per_s = (total_in_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
+        output_tokens_per_s = (total_out_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
+        audio_frames_per_s = (total_audio_frames * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
+
         overall_summary = {
             "e2e_requests": int(self.e2e_count),
             "e2e_wall_time_ms": float(wall_time_ms),
             "e2e_total_tokens": int(self.e2e_total_tokens),
             "e2e_avg_time_per_request_ms": float(e2e_avg_req),
             "e2e_avg_tokens_per_s": float(e2e_avg_tok),
+            "avg_ttft_ms": float(avg_ttft_ms),
+            "avg_tbt_ms": float(avg_tbt_ms),
+            "input_tokens_per_s": float(input_tokens_per_s),
+            "output_tokens_per_s": float(output_tokens_per_s),
+            "audio_frames_per_s": float(audio_frames_per_s),
         }
         # Add stage_wall_time_ms as separate fields for each stage
         for idx, wall_time in enumerate(stage_wall_time_ms):

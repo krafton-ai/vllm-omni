@@ -144,7 +144,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._tts_stage = self._find_tts_stage()
         self._is_tts = self._tts_stage is not None
         self._is_fish_speech = (
-            self._tts_stage is not None and getattr(self._tts_stage, "model_stage", None) == "fish_speech_slow_ar"
+            self._tts_stage is not None and getattr(self._tts_stage.engine_args, "model_stage", None) == "fish_speech_slow_ar"
         )
         self._fish_speech_tokenizer = None
 

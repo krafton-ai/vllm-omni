@@ -82,6 +82,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.engine.arg_utils import _register_omni_hf_configs
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
@@ -237,6 +238,8 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     Unified entry point that automatically handles both LLM and Diffusion models
     through AsyncOmni, which manages multi-stage pipelines.
     """
+    _register_omni_hf_configs()
+
     # Suppress Pydantic serialization warnings globally for multimodal content
     # (e.g., when ChatMessage.content is a list instead of str)
     import warnings as warnings_module
@@ -544,6 +547,12 @@ async def omni_init_app_state(
         or engine_client.model_config is None
     ):
         if vllm_config is not None:
+            # model_config must be set before tokenizer/processor init
+            # (serving classes access engine_client.model_config synchronously)
+            if not hasattr(engine_client, "model_config") or engine_client.model_config is None:
+                engine_client.model_config = vllm_config.model_config
+                logger.info("Initialized model_config for AsyncOmni")
+
             # Try to initialize processors if vllm_config is available
             try:
                 from vllm.plugins.io_processors import get_io_processor
@@ -557,11 +566,6 @@ async def omni_init_app_state(
                             vllm_config=vllm_config,
                         )
                         logger.info("Initialized input_processor for AsyncOmni")
-
-                    # Initialize model_config
-                    if not hasattr(engine_client, "model_config") or engine_client.model_config is None:
-                        engine_client.model_config = vllm_config.model_config
-                        logger.info("Initialized model_config for AsyncOmni")
 
                     # Initialize io_processor
                     if not hasattr(engine_client, "io_processor") or engine_client.io_processor is None:
@@ -631,8 +635,22 @@ async def omni_init_app_state(
         if "generate" in supported_tasks
         else None
     )
+    # Resolve model-specific serving subclasses (e.g. Raon overrides).
+    _model_type = str(getattr(getattr(getattr(engine_client, "model_config", None), "hf_config", None), "model_type", "")).lower()
+    _chat_cls, _speech_cls = OmniOpenAIServingChat, OmniOpenAIServingSpeech
+    try:
+        from vllm_omni.model_executor.models.registry import resolve_serving_classes
+        _rc, _rs = resolve_serving_classes(_model_type)
+        if _rc is not None:
+            _chat_cls = _rc
+        if _rs is not None:
+            _speech_cls = _rs
+    except Exception:
+        logger.debug("Model-specific serving class resolution skipped for %s",
+                      _model_type, exc_info=True)
+
     state.openai_serving_chat = (
-        OmniOpenAIServingChat(
+        _chat_cls(
             engine_client,
             state.openai_serving_models,
             args.response_role,
@@ -782,7 +800,7 @@ async def omni_init_app_state(
         else None
     )
 
-    state.openai_serving_speech = OmniOpenAIServingSpeech(
+    state.openai_serving_speech = _speech_cls(
         engine_client, state.openai_serving_models, request_logger=request_logger
     )
 
@@ -798,6 +816,27 @@ async def omni_init_app_state(
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+
+    if _model_type == "raon":
+        _register_inference_context_endpoint(router)
+
+
+def _register_inference_context_endpoint(target_router: APIRouter) -> None:
+    """Dynamically register the /v1/inference/context endpoint (raon only)."""
+    from vllm_omni.entrypoints.openai.inference_context import inference_ctx
+
+    class _Req(BaseModel):
+        request_id: str = Field(description="The request ID whose inference context to retrieve.")
+
+    @target_router.post("/v1/inference/context", dependencies=[Depends(validate_json_request)])
+    async def get_inference_context(request: _Req, raw_request: Request):
+        ctx = inference_ctx.get_ctx(request.request_id)
+        if ctx is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail=f"No inference context found for request_id: {request.request_id}",
+            )
+        return JSONResponse(content={"request_id": request.request_id, "ctx": ctx})
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:

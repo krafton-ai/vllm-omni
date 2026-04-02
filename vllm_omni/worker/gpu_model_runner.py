@@ -59,6 +59,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
+        self._gpu_retained_buffer_keys: set[str] = set()
+        self._inject_per_request_metadata: bool = False
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
@@ -89,6 +91,11 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+
+        if hasattr(self.model, "gpu_retained_buffer_keys"):
+            self._gpu_retained_buffer_keys = self.model.gpu_retained_buffer_keys
+        if getattr(self.model, "inject_per_request_metadata", False):
+            self._inject_per_request_metadata = True
 
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
@@ -253,7 +260,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
-        for req_id in scheduler_output.finished_req_ids:
+        finished_req_ids = list(scheduler_output.finished_req_ids)
+        if finished_req_ids and hasattr(self.model, 'on_requests_finished'):
+            self.model.on_requests_finished(finished_req_ids)
+        for req_id in finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -986,7 +996,8 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
         per_req_runtime_info = []
-        for req_id in self.input_batch.req_ids:
+        inject_meta = self._inject_per_request_metadata
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests.get(req_id)
             # MammothModa2 AR grid constraint: the model must emit a special
             # end-of-line (EOL) token at the end of each image row.  To determine
@@ -999,13 +1010,29 @@ class OmniGPUModelRunner(GPUModelRunner):
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:
                 info["generated_len"] = generated_len
+                if inject_meta:
+                    num_tokens = (
+                        int(self.query_start_loc.cpu[req_index + 1]) - int(self.query_start_loc.cpu[req_index])
+                        if req_index + 1 < self.query_start_loc.cpu.shape[0]
+                        else 1
+                    )
+                    info["_omni_req_id"] = req_id
+                    info["_num_tokens"] = num_tokens
                 per_req_runtime_info.append(info)
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]
                     if hasattr(q, "shape"):
                         logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
             else:
-                per_req_runtime_info.append({})
+                if inject_meta:
+                    num_tokens = (
+                        int(self.query_start_loc.cpu[req_index + 1]) - int(self.query_start_loc.cpu[req_index])
+                        if req_index + 1 < self.query_start_loc.cpu.shape[0]
+                        else 1
+                    )
+                    per_req_runtime_info.append({"_omni_req_id": req_id, "_num_tokens": num_tokens})
+                else:
+                    per_req_runtime_info.append({})
         return per_req_runtime_info
 
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
@@ -1256,10 +1283,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
+
+            if hasattr(self.model, "preprocess_begin"):
+                self.model.preprocess_begin()
+
+            # Phase 1: collect per-request preprocess results (model may
+            # defer GPU work internally, so results are not final yet).
+            preprocess_results: list[tuple] = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
-                # mimo-audio check
                 req_state = self.requests.get(req_id)
                 req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
 
@@ -1268,11 +1301,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                 s, e = start_offset, start_offset + sched_tokens
                 span_len = int(e) - int(s)
 
-                # call the custom process function
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
                 )
+                preprocess_results.append(
+                    (req_id, s, span_len, req_input_ids, req_embeds, update_dict)
+                )
+
+            # Phase 2: flush any batched GPU work the model deferred.
+            if hasattr(self.model, "preprocess_end"):
+                self.model.preprocess_end()
+
+            # Phase 3: scatter results back into the persistent buffers.
+            for req_id, s, span_len, req_input_ids, req_embeds, update_dict in preprocess_results:
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1289,10 +1331,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.text_step.gpu[decode_slice].copy_(text_step)
                     decode_req_ids.append(req_id)
 
-                # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
 
-                # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
                 inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
@@ -1382,9 +1422,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
             gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
+        gpu_retained_buffer_keys = self._gpu_retained_buffer_keys
         for k, v in upd.items():
             if isinstance(v, torch.Tensor):
-                if k in gpu_keys:
+                if k in gpu_keys or k in gpu_retained_buffer_keys:
                     existing[k] = v.detach().clone()
                 else:
                     existing[k] = v.detach().to("cpu").contiguous()

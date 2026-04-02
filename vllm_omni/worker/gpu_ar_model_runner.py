@@ -605,6 +605,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                     elif isinstance(v, list):
                         element = v[idx] if idx < len(v) else v[0]
+                        if element is None:
+                            continue
                         # Clone tensors to avoid cross-request aliasing
                         if isinstance(element, torch.Tensor):
                             element = element.clone()

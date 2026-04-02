@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
@@ -533,6 +534,46 @@ class TestTTSMethods:
         result = speech_server._estimate_prompt_len(tts_params)
         # Without a real model, it should fall back to 2048.
         assert result == 2048
+
+    def test_build_sampling_params_list_clones_and_applies_request_overrides(
+        self,
+        mocker: MockerFixture,
+    ):
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None
+
+        stage0 = mocker.MagicMock()
+        stage0.is_comprehension = True
+        stage1 = mocker.MagicMock()
+        stage1.is_comprehension = False
+        mock_engine_client.stage_list = [stage0, stage1]
+
+        default_stage0 = SamplingParams(max_tokens=1024, temperature=1.2, seed=42)
+        default_stage1 = SamplingParams(max_tokens=65536, temperature=0.0, seed=42)
+        mock_engine_client.default_sampling_params_list = [default_stage0, default_stage1]
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            max_new_tokens=56,
+        )
+        sampling_params_list = speech_server._build_sampling_params_list(request)
+
+        assert sampling_params_list[0] is not default_stage0
+        assert sampling_params_list[1] is not default_stage1
+        assert sampling_params_list[0].max_tokens == 56
+        assert sampling_params_list[0].temperature == 1.2
+        assert sampling_params_list[1].max_tokens == 65536
+        assert default_stage0.max_tokens == 1024
+        assert default_stage0.temperature == 1.2
 
     def test_validate_tts_request_basic(self, speech_server):
         """Test basic validation cases."""

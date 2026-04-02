@@ -152,8 +152,21 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    "RaonModel": ("raon", "raon", "RaonModel"),
+    "RaonCode2WavModel": ("raon", "raon_code2wav", "RaonCode2WavModel"),
 }
 
+
+_SERVING_HOOKS: dict[str, str] = {
+    "raon": "vllm_omni.model_executor.models.raon.serving_utils:RaonServingHooks",
+}
+
+_SERVING_CLASSES: dict[str, tuple[str, str]] = {
+    "raon": (
+        "vllm_omni.model_executor.models.raon.serving_utils:RaonOpenAIServingChat",
+        "vllm_omni.model_executor.models.raon.serving_utils:RaonOpenAIServingSpeech",
+    ),
+}
 
 _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,
@@ -178,3 +191,45 @@ OmniModelRegistry = _ModelRegistry(
         },
     }
 )
+
+
+def resolve_model_type(vllm_config, stage_configs=None) -> str | None:
+    """Resolve model type from vllm_config or stage_configs."""
+    try:
+        model_type = vllm_config.model_config.hf_config.model_type
+        if model_type in _SERVING_HOOKS:
+            return model_type
+    except (AttributeError, TypeError):
+        pass
+    if stage_configs:
+        for cfg in stage_configs:
+            model_type = getattr(cfg, "model_type", None)
+            if model_type and model_type in _SERVING_HOOKS:
+                return model_type
+    return None
+
+
+def create_serving_hooks(model_type: str, model_config=None):
+    """Create serving hooks instance for the given model type."""
+    if model_type not in _SERVING_HOOKS:
+        return None
+    module_path, cls_name = _SERVING_HOOKS[model_type].rsplit(":", 1)
+    import importlib
+
+    module = importlib.import_module(module_path)
+    cls = getattr(module, cls_name)
+    return cls(model_config)
+
+
+def resolve_serving_classes(model_type: str | None) -> tuple[type | None, type | None]:
+    """Return (ChatClass, SpeechClass) for *model_type*, or (None, None)."""
+    if not model_type or model_type not in _SERVING_CLASSES:
+        return None, None
+    import importlib
+
+    result = []
+    for dotted in _SERVING_CLASSES[model_type]:
+        mod_path, cls_name = dotted.rsplit(":", 1)
+        mod = importlib.import_module(mod_path)
+        result.append(getattr(mod, cls_name))
+    return tuple(result)  # type: ignore[return-value]
