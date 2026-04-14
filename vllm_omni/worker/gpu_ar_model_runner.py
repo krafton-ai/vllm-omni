@@ -784,7 +784,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             sched = int(num_scheduled_tokens_np[idx])
             end = start + sched
             hidden_slice = hidden_states_cpu[start:end]
-            payload: dict[str, object] = {"hidden": hidden_slice}
+            # Skip hidden states in AR payload when the downstream stage does not use them.
+            payload: dict[str, object] = {}
+            if getattr(self.model, "emit_hidden_in_payload", True):
+                payload["hidden"] = hidden_slice
             if mm_cpu:
                 mm_payload: dict[str, object] = {}
                 for k, v in mm_cpu.items():
@@ -794,6 +797,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                     elif isinstance(v, list):
                         element = v[idx] if idx < len(v) else v[0]
+                        # Some models may emit None for requests without multimodal output.
+                        if element is None:
+                            continue
                         # Clone tensors to avoid cross-request aliasing
                         if isinstance(element, torch.Tensor):
                             element = element.clone()

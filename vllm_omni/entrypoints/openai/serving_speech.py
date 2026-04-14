@@ -49,12 +49,14 @@ _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
+_RAON_TTS_MODEL_STAGES = {"ar"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
+    | _RAON_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -290,6 +292,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "cosyvoice3"
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
+        if model_stage in _RAON_TTS_MODEL_STAGES:
+            return "raon"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -690,9 +694,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
 
         emb_dim = len(embedding)
-        if emb_dim not in {1024, 2048}:
+        if emb_dim not in {192, 1024, 2048}:
             logger.warning(
-                "speaker_embedding has %d dimensions; expected 1024 (0.6B) or 2048 (1.7B)",
+                "speaker_embedding has %d dimensions; expected 192, 1024, or 2048",
                 emb_dim,
             )
 
@@ -730,6 +734,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "file_size": file_path.stat().st_size,
             "embedding_source": "direct",
             "embedding_dim": emb_dim,
+            "embedding_tensor": embedding,
         }
 
         self.uploaded_speakers[voice_name_lower] = speaker_data
@@ -787,6 +792,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_fish_tts_request(request)
         if self._tts_model_type == "cosyvoice3":
             return self._validate_cosyvoice3_request(request)
+        if self._tts_model_type == "raon":
+            return self._validate_raon_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
@@ -992,6 +999,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
 
         return None
+
+    def _validate_raon_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Raon request parameters. Returns error message or None."""
+        from vllm_omni.model_executor.models.raon.serving_utils import RaonServingHooks
+
+        return RaonServingHooks.validate_request(request)
 
     def _validate_cosyvoice3_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate CosyVoice3 request parameters. Returns error message or None."""
@@ -1383,6 +1396,101 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             },
         }
 
+    # ---- Raon helpers ----
+
+    async def _build_raon_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build Raon engine prompt using RaonChatTemplateBuilder.
+
+        Speaker priority: uploaded voice > speaker_embedding > ref_audio.
+        """
+        from vllm_omni.model_executor.models.raon.serving_utils import RaonServingHooks
+
+        hooks = RaonServingHooks(self.model_config)
+        additional_info: dict[str, Any] = {
+            "force_audio_first_token": [True],
+            "output_mode": ["audio_only"],
+        }
+
+        # Speaker resolution (priority: uploaded voice > speaker_embedding > ref_audio > default)
+        has_speaker = False
+        is_icl = hooks._is_icl_request(request)
+
+        if request.voice and request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
+            speaker_info = self.uploaded_speakers[request.voice.lower()]
+            if speaker_info.get("embedding_source") == "direct":
+                stored_emb = speaker_info.get("embedding_tensor")
+                if stored_emb is not None:
+                    # Store as plain list so it survives msgspec IPC serialization.
+                    additional_info["cached_spk_embedding"] = [torch.tensor(stored_emb, dtype=torch.float32).tolist()]
+                    has_speaker = True
+                else:
+                    logger.warning("Uploaded voice '%s' has no stored embedding", request.voice)
+            else:
+                file_path = speaker_info.get("file_path")
+                if file_path and Path(file_path).exists():
+                    with open(file_path, "rb") as f:
+                        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    mime_type = speaker_info.get("mime_type", "audio/wav")
+                    additional_info["speaker_ref_audio"] = [f"data:{mime_type};base64,{audio_b64}"]
+                    has_speaker = True
+                else:
+                    logger.warning("Uploaded voice '%s' audio file missing at %s", request.voice, file_path)
+        elif request.speaker_embedding is not None:
+            # Store as plain list so it survives msgspec IPC serialization.
+            additional_info["cached_spk_embedding"] = [
+                torch.tensor(request.speaker_embedding, dtype=torch.float32).tolist()
+            ]
+            has_speaker = True
+        elif request.ref_audio is not None and isinstance(request.ref_audio, str):
+            additional_info["speaker_ref_audio"] = [request.ref_audio]
+            has_speaker = True
+
+        # Default speaker fallback: use pre-computed ECAPA embedding so the
+        # model always receives speaker conditioning (matches training distribution).
+        if not has_speaker and not is_icl:
+            from vllm_omni.model_executor.models.raon.serving_utils import get_default_speaker_embedding
+
+            default_emb = get_default_speaker_embedding()
+            if default_emb is not None:
+                # Store as plain list so it survives msgspec IPC serialization.
+                additional_info["cached_spk_embedding"] = [default_emb.tolist()]
+                has_speaker = True
+
+        # Build prompt using chat template
+        if is_icl:
+            additional_info["icl_mode"] = [True]
+            additional_info["source_ref_text"] = [str(request.ref_text or "")]
+            # No silence bootstrap for continuation — model continues from ref frames.
+            additional_info["continuation_silence_frames"] = [0]
+            prompt_text = await hooks._build_icl_tts_prompt(
+                target_text=request.input,
+                ref_text=request.ref_text,
+                prepend_speaker_token=has_speaker,
+                engine_client=self.engine_client,
+            )
+            prompt: dict[str, Any] = {"prompt": prompt_text}
+            # Pass ref_audio through multimodal pipeline for codec prefill.
+            if request.ref_audio and isinstance(request.ref_audio, str):
+                try:
+                    ref_np, ref_sr = await self._resolve_ref_audio(request.ref_audio)
+                    ref_np = np.asarray(ref_np, dtype=np.float32)
+                    prompt["multi_modal_data"] = {"audio": [(ref_np, ref_sr)]}
+                except Exception:
+                    logger.warning("Failed to resolve ref_audio for ICL prefill", exc_info=True)
+        else:
+            prompt_text = await hooks.build_tts_prompt(
+                request.input,
+                prepend_speaker_token=has_speaker,
+                engine_client=self.engine_client,
+            )
+            prompt = {"prompt": prompt_text}
+
+        if request.max_new_tokens is None:
+            request.max_new_tokens = hooks.estimate_tts_max_tokens(request.input)
+
+        prompt["additional_information"] = additional_info
+        return prompt
+
     # ---- Common speech generation helpers ----
 
     async def _prepare_speech_generation(
@@ -1440,6 +1548,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params = {}
             elif self._tts_model_type == "cosyvoice3":
                 prompt = await self._build_cosyvoice3_prompt(request)
+                tts_params = {}
+            elif self._tts_model_type == "raon":
+                prompt = await self._build_raon_prompt(request)
                 tts_params = {}
             else:
                 tts_params = self._build_tts_params(request)
@@ -1501,6 +1612,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 min_tokens,
                 max_tokens,
             )
+
+        # Raon: apply task-specific sampling params for TTS.
+        if self._tts_model_type == "raon" and sampling_params_list:
+            import copy
+
+            from vllm_omni.model_executor.models.raon.serving_utils import RaonServingHooks
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            hooks = RaonServingHooks(self.model_config)
+            hooks.apply_task_sampling_params(
+                sampling_params_list[0],
+                task="tts",
+            )
+            if request.max_new_tokens is not None:
+                sampling_params_list[0].max_tokens = request.max_new_tokens
 
         # Fish defaults come from stage_configs YAML. Only override when the caller
         # explicitly requests a different generation length.

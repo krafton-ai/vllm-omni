@@ -41,6 +41,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.raon import RaonConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -60,6 +61,7 @@ def _register_omni_hf_configs() -> None:
         ("omnivoice", OmniVoiceConfig),
         ("voxtral_tts", VoxtralTTSConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("raon", RaonConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

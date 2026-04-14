@@ -168,6 +168,8 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    "RaonModel": ("raon", "raon", "RaonModel"),
+    "RaonCode2WavModel": ("raon", "raon_code2wav", "RaonCode2WavModel"),
 }
 
 

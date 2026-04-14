@@ -83,6 +83,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 
+from vllm_omni.engine.arg_utils import _register_omni_hf_configs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -252,6 +253,8 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     Unified entry point that automatically handles both LLM and Diffusion models
     through AsyncOmni, which manages multi-stage pipelines.
     """
+    _register_omni_hf_configs()
+
     # Suppress Pydantic serialization warnings globally for multimodal content
     # (e.g., when ChatMessage.content is a list instead of str)
     import warnings as warnings_module
@@ -561,14 +564,17 @@ async def omni_init_app_state(
     )
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
-    # Ensure input_processor, io_processor, and model_config exist for OpenAIServingModels compatibility
+    # model_config must be set before tokenizer/processor init
+    if vllm_config is not None and (not hasattr(engine_client, "model_config") or engine_client.model_config is None):
+        engine_client.model_config = vllm_config.model_config
+        logger.info("Initialized model_config for AsyncOmni")
+
+    # Ensure input_processor, io_processor exist for OpenAIServingModels compatibility
     if (
         not hasattr(engine_client, "input_processor")
         or engine_client.input_processor is None
         or not hasattr(engine_client, "io_processor")
         or engine_client.io_processor is None
-        or not hasattr(engine_client, "model_config")
-        or engine_client.model_config is None
     ):
         if vllm_config is not None:
             # Try to initialize processors if vllm_config is available
@@ -584,11 +590,6 @@ async def omni_init_app_state(
                             vllm_config=vllm_config,
                         )
                         logger.info("Initialized input_processor for AsyncOmni")
-
-                    # Initialize model_config
-                    if not hasattr(engine_client, "model_config") or engine_client.model_config is None:
-                        engine_client.model_config = vllm_config.model_config
-                        logger.info("Initialized model_config for AsyncOmni")
 
                     # Initialize io_processor
                     if not hasattr(engine_client, "io_processor") or engine_client.io_processor is None:

@@ -205,6 +205,46 @@ def test_update_intermediate_buffer_accumulates():
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
 
 
+def test_update_intermediate_buffer_clones_retained_gpu_key():
+    """Retained GPU keys must be copied to avoid aliasing reused output buffers."""
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.gpu_resident_buffer_keys = {"speaker_embeds", "prev_hidden"}
+
+    source = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {"speaker_embeds": source},
+    )
+
+    retained = runner.model_intermediate_buffer["r1"]["speaker_embeds"]
+    assert torch.allclose(retained, torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32))
+    assert retained.data_ptr() != source.data_ptr()
+
+    source.add_(100.0)
+    assert torch.allclose(retained, torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32))
+
+
+def test_update_intermediate_buffer_clones_prev_hidden():
+    """prev_hidden should be copied to avoid aliasing reused output buffers."""
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.gpu_resident_buffer_keys = {"speaker_embeds", "prev_hidden"}
+
+    source = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {"prev_hidden": source},
+    )
+
+    retained = runner.model_intermediate_buffer["r1"]["prev_hidden"]
+    assert torch.allclose(retained, torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32))
+    assert retained.data_ptr() != source.data_ptr()
+
+    source.add_(100.0)
+    assert torch.allclose(retained, torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32))
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
