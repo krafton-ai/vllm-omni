@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 
 # Model identifier – placeholder for local checkpoint path.
 models = ["/path/to/Raon"]

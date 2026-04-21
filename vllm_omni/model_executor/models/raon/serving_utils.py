@@ -613,8 +613,6 @@ class RaonServingHooks:
         ref_text = getattr(request, "ref_text", None)
         return bool(isinstance(ref_audio, str) and ref_audio.strip() and isinstance(ref_text, str) and ref_text.strip())
 
-    _is_icl_request = is_icl_request
-
     @staticmethod
     def validate_request(request: Any) -> str | None:
         """Validate Raon request. Returns error message or None."""
@@ -764,7 +762,7 @@ async def build_raon_speech_prompt(serving: Any, request: Any) -> dict[str, Any]
     if request.voice and request.voice.lower() in serving.uploaded_speakers and request.ref_audio is None:
         speaker_info = serving.uploaded_speakers[request.voice.lower()]
         if speaker_info.get("embedding_source") == "direct":
-            stored_emb = speaker_info.get("embedding_tensor")
+            stored_emb = serving._get_uploaded_speaker_embedding(request.voice)
             if stored_emb is not None:
                 additional_info["cached_spk_embedding"] = [torch.tensor(stored_emb, dtype=torch.float32).tolist()]
                 has_speaker = True
@@ -1335,3 +1333,29 @@ def encode_pcm_to_wav_data_url(pcm: np.ndarray, sample_rate: int) -> str:
 
 def count_words(text: str) -> int:
     return len((text or "").split())
+
+
+async def maybe_rolling_icl_audio_bytes(
+    serving: Any,
+    request: Any,
+    base64_encode: bool = False,
+) -> tuple[Any, str] | None:
+    """If the request qualifies for rolling ICL, generate audio and return
+    ``(audio_data, media_type)``.  Otherwise return ``None`` so the caller
+    falls through to the normal one-shot path."""
+    if not should_use_rolling_icl(request.input or ""):
+        return None
+
+    from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+
+    audio_tensor, sample_rate = await generate_raon_long_tts_rolling_icl(serving, request)
+    audio_obj = CreateAudio(
+        audio_tensor=audio_tensor,
+        sample_rate=sample_rate,
+        response_format=request.response_format or "wav",
+        speed=request.speed or 1.0,
+        stream_format=request.stream_format,
+        base64_encode=base64_encode,
+    )
+    audio_response: AudioResponse = serving.create_audio(audio_obj)
+    return audio_response.audio_data, audio_response.media_type

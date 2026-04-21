@@ -47,6 +47,8 @@ REQUEST_STATE_CLEANUP_PREFIXES: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class RaonEnvConfig:
+    """Frozen at import time; later env-var changes do not take effect."""
+
     # TTS sampling
     tts_temperature: float
     tts_top_k: int
@@ -94,6 +96,7 @@ def _log_long_tts_config(config: RaonEnvConfig) -> None:
 
 
 def _load_raon_env_config() -> RaonEnvConfig:
+    """Build ``ENV`` from env vars. Called once at import."""
     config = RaonEnvConfig(
         tts_temperature=float(os.getenv("RAON_TTS_TEMPERATURE", "1.0")),
         tts_top_k=int(os.getenv("RAON_TTS_TOP_K", "0")),

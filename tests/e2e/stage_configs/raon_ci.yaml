@@ -16,7 +16,7 @@ stage_args:
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: true
-      trust_remote_code: false
+      trust_remote_code: true
       # Keep stage0 within CI GPU memory budget.
       gpu_memory_utilization: 0.55
       max_model_len: 3072
@@ -48,12 +48,12 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: codec2wav
-      model_arch: RaonModel
+      model_arch: RaonCode2WavModel
       hf_config_name: audio_tokenizer_config
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
-      trust_remote_code: false
+      trust_remote_code: true
       gpu_memory_utilization: 0.12
       # Must not exceed the derived max_model_len from the model's
       # `audio_tokenizer_config` (often 8000 for this family).
