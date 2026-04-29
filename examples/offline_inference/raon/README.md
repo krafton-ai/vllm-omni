@@ -15,6 +15,16 @@ Supported tasks:
 
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation for your hardware.
 
+When running the offline demo from Docker, allocate enough shared memory for
+vLLM-Omni stage communication and PyTorch multiprocessing:
+
+```bash
+docker run --gpus all --shm-size=16g ...
+```
+
+`--ipc=host` is also acceptable in environments where host IPC sharing is
+allowed.
+
 The default stage config for Raon is at:
 ```
 vllm_omni/model_executor/stage_configs/raon.yaml
@@ -101,4 +111,11 @@ python end2end.py --query-type tts \
 - Use `--output-dir` to change the output folder.
 - The default stage config path is `vllm_omni/model_executor/stage_configs/raon.yaml`. Override with `--stage-configs-path`.
 - For voice cloning, provide a clear, clean reference audio (3-8 seconds recommended).
-- When running in Docker, use `--shm-size=2g` to avoid shared memory exhaustion during concurrent audio generation.
+- Long-form TTS defaults to a final-chunk EOS minimum gate with best-of-k and
+  final retry disabled. Override with:
+  - `RAON_TTS_LONG_ENABLE_FINAL_BEST_OF_K`
+  - `RAON_TTS_LONG_ENABLE_FINAL_EOS_MIN_GATE`
+  - `RAON_TTS_LONG_FINAL_EOS_MIN_DURATION_RATIO`
+  - `RAON_TTS_LONG_ENABLE_FINAL_EOS_RETRY`
+- When running in Docker, use `--shm-size=16g` or `--ipc=host` to avoid shared
+  memory exhaustion during concurrent audio generation.

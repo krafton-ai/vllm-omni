@@ -805,6 +805,9 @@ async def build_raon_speech_prompt(serving: Any, request: Any) -> dict[str, Any]
         additional_info["icl_mode"] = [True]
         additional_info["source_ref_text"] = [str(request.ref_text or "")]
         additional_info["continuation_silence_frames"] = [int(_RAON_ENV_ICL.continuation_silence_frames)]
+        min_audio_steps = getattr(request, "_raon_min_audio_steps", None)
+        if min_audio_steps is not None and int(min_audio_steps) > 0:
+            additional_info["audio_min_steps"] = [int(min_audio_steps)]
         prompt_text = await hooks._build_icl_tts_prompt(
             target_text=request.input,
             ref_text=request.ref_text,
@@ -975,6 +978,32 @@ async def collect_best_of_k_request_pcm(
     return np.asarray(best_pcm, dtype=np.float32), int(best_sr), selection_meta
 
 
+def estimate_final_eos_min_steps(
+    *,
+    target_words: int,
+    previous_chunk_stats: Sequence[tuple[int, float]],
+    fallback_wps: float,
+    min_duration_ratio: float,
+    frame_rate_hz: float,
+) -> int:
+    if int(target_words) <= 0 or float(min_duration_ratio) <= 0 or float(frame_rate_hz) <= 0:
+        return 0
+    observed_words = 0
+    observed_duration_s = 0.0
+    for words, duration_s in previous_chunk_stats:
+        if int(words) > 0 and float(duration_s) > 0:
+            observed_words += int(words)
+            observed_duration_s += float(duration_s)
+    if observed_words > 0 and observed_duration_s > 0:
+        wps = float(observed_words) / float(observed_duration_s)
+    else:
+        wps = float(fallback_wps)
+    if wps <= 0:
+        return 0
+    expected_duration_s = float(target_words) / wps
+    return max(0, int(round(expected_duration_s * float(min_duration_ratio) * float(frame_rate_hz))))
+
+
 async def generate_raon_long_tts_rolling_icl(serving: Any, request: Any) -> tuple[np.ndarray, int]:
     """Run long-form Raon TTS with sentence-chunked rolling ICL.
 
@@ -1054,6 +1083,7 @@ async def generate_raon_long_tts_rolling_icl(serving: Any, request: Any) -> tupl
     sample_rate: int = 24000
     prev_pcm: np.ndarray | None = None
     prev_sr: int | None = None
+    chunk_stats: list[tuple[int, float]] = []
 
     for chunk_idx, plan in enumerate(plans):
         chunk_text = plan.text
@@ -1089,9 +1119,31 @@ async def generate_raon_long_tts_rolling_icl(serving: Any, request: Any) -> tupl
 
         t0 = time.perf_counter()
         is_final_chunk = chunk_idx == len(plans) - 1
+        target_words_final = count_words(chunk_text)
+        final_expected_duration_s: float | None = None
+        if is_final_chunk and ENV.tts_long_enable_final_eos_min_gate:
+            min_steps = estimate_final_eos_min_steps(
+                target_words=target_words_final,
+                previous_chunk_stats=chunk_stats,
+                fallback_wps=float(ENV.tts_long_final_best_of_k_expected_wps),
+                min_duration_ratio=float(ENV.tts_long_final_eos_min_duration_ratio),
+                frame_rate_hz=float(ENV.tts_long_final_eos_gate_frame_rate_hz),
+            )
+            if min_steps > 0:
+                object.__setattr__(chunk_req, "_raon_min_audio_steps", int(min_steps))
+                final_expected_duration_s = (
+                    float(min_steps)
+                    / max(1e-6, float(ENV.tts_long_final_eos_gate_frame_rate_hz))
+                    / max(1e-6, float(ENV.tts_long_final_eos_min_duration_ratio))
+                )
+                logger.debug(
+                    "Raon rolling-ICL final EOS min gate: target_words=%d min_steps=%d expected_duration_s=%.2f",
+                    target_words_final,
+                    min_steps,
+                    final_expected_duration_s,
+                )
         if is_final_chunk and ENV.tts_long_enable_final_best_of_k and int(ENV.tts_long_final_best_of_k) >= 2:
             k = int(ENV.tts_long_final_best_of_k)
-            target_words_final = count_words(chunk_text)
             chunk_pcm, chunk_sr, best_meta = await collect_best_of_k_request_pcm(
                 serving,
                 chunk_req,
@@ -1114,6 +1166,44 @@ async def generate_raon_long_tts_rolling_icl(serving: Any, request: Any) -> tupl
             )
         else:
             chunk_pcm, chunk_sr = await collect_request_pcm(serving, chunk_req)
+            if (
+                is_final_chunk
+                and ENV.tts_long_enable_final_eos_min_gate
+                and ENV.tts_long_enable_final_eos_retry
+                and final_expected_duration_s is not None
+            ):
+                retry_threshold_s = final_expected_duration_s * float(ENV.tts_long_final_eos_retry_duration_ratio)
+                first_duration_s = float(np.asarray(chunk_pcm).size) / float(max(1, int(chunk_sr)))
+                if first_duration_s < retry_threshold_s:
+                    retry_req = chunk_req.model_copy(deep=True)
+                    if getattr(chunk_req, "_rolling_plan_budget_explicit", False):
+                        object.__setattr__(retry_req, "_rolling_plan_budget_explicit", True)
+                    if getattr(chunk_req, "_raon_min_audio_steps", None) is not None:
+                        min_audio_steps = getattr(chunk_req, "_raon_min_audio_steps")
+                        object.__setattr__(
+                            retry_req,
+                            "_raon_min_audio_steps",
+                            min_audio_steps,
+                        )
+                    base_seed_opt = _stable_request_seed(
+                        text=retry_req.input or "",
+                        task_type=getattr(retry_req, "task_type", None),
+                        ref_audio=getattr(retry_req, "ref_audio", None),
+                        base_seed=0,
+                    )
+                    object.__setattr__(retry_req, "seed", int(((base_seed_opt or 0) + 1) & 0x7FFFFFFF))
+                    retry_pcm, retry_sr = await collect_request_pcm(serving, retry_req)
+                    retry_duration_s = float(np.asarray(retry_pcm).size) / float(max(1, int(retry_sr)))
+                    logger.debug(
+                        "Raon rolling-ICL final EOS retry: first_duration_s=%.2f retry_duration_s=%.2f "
+                        "threshold_s=%.2f selected=%s",
+                        first_duration_s,
+                        retry_duration_s,
+                        retry_threshold_s,
+                        "retry" if retry_duration_s > first_duration_s else "first",
+                    )
+                    if retry_duration_s > first_duration_s:
+                        chunk_pcm, chunk_sr = retry_pcm, retry_sr
         duration_s = chunk_pcm.size / float(max(1, chunk_sr))
         elapsed = time.perf_counter() - t0
         target_words_log = count_words(chunk_text)
@@ -1155,6 +1245,7 @@ async def generate_raon_long_tts_rolling_icl(serving: Any, request: Any) -> tupl
         else:
             prev_pcm = raw_pcm
             prev_sr = sample_rate
+        chunk_stats.append((target_words_log, duration_s))
 
     pauses_ms = [pause_ms_for_boundary(plans[k].boundary_kind) for k in range(len(plans) - 1)]
     logger.info("Raon rolling-ICL complete: plans=%d", len(plans))

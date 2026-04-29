@@ -79,19 +79,31 @@ class RaonEnvConfig:
     tts_long_min_ref_audio_s: float = 1.0
     tts_long_keep_original_speaker_anchor: bool = True
     tts_long_eos_suppress_grace_steps: int = 2
-    tts_long_enable_final_best_of_k: bool = True
+    tts_long_enable_final_best_of_k: bool = False
     tts_long_final_best_of_k: int = 5
     tts_long_final_best_of_k_early_exit_ratio: float = 1.15
     tts_long_final_best_of_k_expected_wps: float = 2.8
     tts_long_final_best_of_k_score_mode: str = "duration"
+    tts_long_enable_final_eos_min_gate: bool = True
+    tts_long_final_eos_min_duration_ratio: float = 0.55
+    tts_long_final_eos_gate_frame_rate_hz: float = 24.0
+    tts_long_enable_final_eos_retry: bool = False
+    tts_long_final_eos_retry_duration_ratio: float = 0.95
 
 
 def _log_long_tts_config(config: RaonEnvConfig) -> None:
     logger.info(
-        "Raon long-TTS config: tts_long_mode=%s tts_long_max_sentences_per_chunk=%d tts_long_enable_final_best_of_k=%s",
+        "Raon long-TTS config: tts_long_mode=%s tts_long_max_sentences_per_chunk=%d "
+        "tts_long_enable_final_best_of_k=%s tts_long_enable_final_eos_min_gate=%s "
+        "tts_long_final_eos_min_duration_ratio=%.2f tts_long_enable_final_eos_retry=%s "
+        "tts_long_final_eos_gate_frame_rate_hz=%.2f",
         config.tts_long_mode,
         config.tts_long_max_sentences_per_chunk,
         config.tts_long_enable_final_best_of_k,
+        config.tts_long_enable_final_eos_min_gate,
+        config.tts_long_final_eos_min_duration_ratio,
+        config.tts_long_enable_final_eos_retry,
+        config.tts_long_final_eos_gate_frame_rate_hz,
     )
 
 
@@ -129,7 +141,7 @@ def _load_raon_env_config() -> RaonEnvConfig:
         .lower()
         not in ("0", "false", "no", "off"),
         tts_long_eos_suppress_grace_steps=int(os.getenv("RAON_TTS_LONG_EOS_SUPPRESS_GRACE_STEPS", "2")),
-        tts_long_enable_final_best_of_k=os.getenv("RAON_TTS_LONG_ENABLE_FINAL_BEST_OF_K", "1").strip().lower()
+        tts_long_enable_final_best_of_k=os.getenv("RAON_TTS_LONG_ENABLE_FINAL_BEST_OF_K", "0").strip().lower()
         not in ("0", "false", "no", "off"),
         tts_long_final_best_of_k=int(os.getenv("RAON_TTS_LONG_FINAL_BEST_OF_K", "5")),
         tts_long_final_best_of_k_early_exit_ratio=float(
@@ -139,6 +151,15 @@ def _load_raon_env_config() -> RaonEnvConfig:
         tts_long_final_best_of_k_score_mode=os.getenv("RAON_TTS_LONG_FINAL_BEST_OF_K_SCORE_MODE", "duration")
         .strip()
         .lower(),
+        tts_long_enable_final_eos_min_gate=os.getenv("RAON_TTS_LONG_ENABLE_FINAL_EOS_MIN_GATE", "1").strip().lower()
+        not in ("0", "false", "no", "off"),
+        tts_long_final_eos_min_duration_ratio=float(os.getenv("RAON_TTS_LONG_FINAL_EOS_MIN_DURATION_RATIO", "0.55")),
+        tts_long_final_eos_gate_frame_rate_hz=float(os.getenv("RAON_TTS_LONG_FINAL_EOS_GATE_FRAME_RATE_HZ", "24.0")),
+        tts_long_enable_final_eos_retry=os.getenv("RAON_TTS_LONG_ENABLE_FINAL_EOS_RETRY", "0").strip().lower()
+        not in ("0", "false", "no", "off"),
+        tts_long_final_eos_retry_duration_ratio=float(
+            os.getenv("RAON_TTS_LONG_FINAL_EOS_RETRY_DURATION_RATIO", "0.95")
+        ),
     )
     _log_long_tts_config(config)
     return config

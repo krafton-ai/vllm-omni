@@ -17,6 +17,27 @@ if TYPE_CHECKING:
     from vllm_omni.model_executor.models.raon.raon import AudioDecodeState, RaonModel
 
 
+def _info_int(req_info: dict[str, Any] | None, key: str, default: int = 0) -> int:
+    if not isinstance(req_info, dict):
+        return default
+    value = unwrap_singleton_list(req_info.get(key, default))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def audio_end_suppress_until(req_state: AudioDecodeState | None, req_info: dict[str, Any] | None) -> int:
+    if req_state is None:
+        return 0
+    seam_until = (
+        req_state.continuation_silence_frames + int(ENV.tts_long_eos_suppress_grace_steps)
+        if req_state.continuation_silence_frames > 0
+        else 0
+    )
+    return max(seam_until, _info_int(req_info, "audio_min_steps", 0))
+
+
 class LogitsRouter:
     def __init__(self, model: RaonModel) -> None:
         self.model = model
@@ -47,13 +68,9 @@ class LogitsRouter:
             and req_state.audio_step_index < req_state.continuation_silence_frames
         )
 
-        # Suppress AUDIO_END during continuation silence and the
-        # env-configured grace window near rolling-ICL chunk seams.
-        _eos_suppress_until = (
-            req_state.continuation_silence_frames + int(ENV.tts_long_eos_suppress_grace_steps)
-            if req_state is not None and req_state.continuation_silence_frames > 0
-            else 0
-        )
+        # Suppress AUDIO_END during continuation silence, near rolling-ICL
+        # seams, and optionally until a request-scoped minimum audio length.
+        _eos_suppress_until = audio_end_suppress_until(req_state, req_info)
         if req_state is not None and req_state.audio_step_index < _eos_suppress_until:
             audio_logits_row = audio_logits_row.clone()
             audio_logits_row[self.model.codebook_size] = float("-inf")

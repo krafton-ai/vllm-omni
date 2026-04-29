@@ -12,6 +12,16 @@ Please refer to the [README.md](https://github.com/vllm-project/vllm-omni/tree/m
 ./run_server.sh
 ```
 
+When launching the server from Docker, allocate enough shared memory for
+vLLM-Omni stage communication and PyTorch multiprocessing:
+
+```bash
+docker run --gpus all --shm-size=16g ...
+```
+
+`--ipc=host` is also acceptable in environments where host IPC sharing is
+allowed.
+
 Or manually:
 
 ```bash
@@ -139,4 +149,11 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - The stage config is at `vllm_omni/model_executor/stage_configs/raon.yaml`.
 - Sample rate is 24000 Hz.
 - For voice cloning, provide a clear reference audio clip (3-8 seconds recommended).
-- When running in Docker, use `--shm-size=2g` to avoid shared memory exhaustion during concurrent audio generation.
+- Long-form TTS defaults to a final-chunk EOS minimum gate with best-of-k and
+  final retry disabled. Override with:
+  - `RAON_TTS_LONG_ENABLE_FINAL_BEST_OF_K`
+  - `RAON_TTS_LONG_ENABLE_FINAL_EOS_MIN_GATE`
+  - `RAON_TTS_LONG_FINAL_EOS_MIN_DURATION_RATIO`
+  - `RAON_TTS_LONG_ENABLE_FINAL_EOS_RETRY`
+- When running in Docker, use `--shm-size=16g` or `--ipc=host` to avoid shared
+  memory exhaustion during concurrent audio generation.

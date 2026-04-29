@@ -12,6 +12,7 @@ from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
 from vllm_omni.model_executor.models.raon.raon import (
+    AudioDecodeState,
     RaonModel,
     RaonMultiModalProcessor,
     _infer_audio_placeholder_token_ids,
@@ -324,13 +325,16 @@ class TestRaonConfigConstruction:
         assert cfg.speaker_token_id is None
         assert cfg.speaker_embedding_to_code_predictor is None
 
-    def test_env_defaults_to_rolling_icl_and_logs(self, monkeypatch):
+    def test_env_defaults_to_gate055_noretry_and_logs(self, monkeypatch):
         from vllm_omni.transformers_utils.configs import raon as raon_config_module
 
         for name in (
             "RAON_TTS_LONG_MODE",
             "RAON_TTS_LONG_MAX_SENTENCES_PER_CHUNK",
             "RAON_TTS_LONG_ENABLE_FINAL_BEST_OF_K",
+            "RAON_TTS_LONG_ENABLE_FINAL_EOS_MIN_GATE",
+            "RAON_TTS_LONG_FINAL_EOS_MIN_DURATION_RATIO",
+            "RAON_TTS_LONG_ENABLE_FINAL_EOS_RETRY",
         ):
             monkeypatch.delenv(name, raising=False)
 
@@ -342,11 +346,17 @@ class TestRaonConfigConstruction:
 
         assert env.tts_long_mode == "rolling_icl"
         assert env.tts_long_max_sentences_per_chunk == 1
-        assert env.tts_long_enable_final_best_of_k is True
+        assert env.tts_long_enable_final_best_of_k is False
+        assert env.tts_long_enable_final_eos_min_gate is True
+        assert env.tts_long_final_eos_min_duration_ratio == 0.55
+        assert env.tts_long_enable_final_eos_retry is False
         assert any(
             "tts_long_mode=rolling_icl" in record.getMessage()
             and "tts_long_max_sentences_per_chunk=1" in record.getMessage()
-            and "tts_long_enable_final_best_of_k=True" in record.getMessage()
+            and "tts_long_enable_final_best_of_k=False" in record.getMessage()
+            and "tts_long_enable_final_eos_min_gate=True" in record.getMessage()
+            and "tts_long_final_eos_min_duration_ratio=0.55" in record.getMessage()
+            and "tts_long_enable_final_eos_retry=False" in record.getMessage()
             for record in records
         )
 
@@ -1009,6 +1019,14 @@ def test_logits_router_apply_row_mode_adjustments_tracks_per_request_talker_hidd
         model._step_talker_hidden_rows["req-b"],
         audio_hidden_states[1:2],
     )
+
+
+def test_logits_router_audio_end_suppress_until_uses_request_min_steps():
+    from vllm_omni.model_executor.models.raon.logits_routing import audio_end_suppress_until
+
+    req_state = AudioDecodeState(audio_step_index=12, continuation_silence_frames=2)
+
+    assert audio_end_suppress_until(req_state, {"audio_min_steps": [40]}) == 40
 
 
 def test_postprocess_uses_per_request_talker_hidden_for_text_only_batch():
